@@ -68,7 +68,39 @@ int cp0(int ifd, int ofd, off_t sz) {
 }
 
 // Vectored read/write.
+// Three options:
+//   1. Redo window on interrupt;
+//   2. Force returned data through, potentially aligning to blocksize;
+//   2. Force rest of current window through with retry.
+// For full throughput would need two threads.
 int cp1(int ifd, int ofd, off_t sz) {
+	// Setup IO vectors.
+	struct iovec vect[QUEUE_DEPTH];
+	for (int i = 0; i < QUEUE_DEPTH; i++) {
+		vect[i].iov_base = malloc(BLOCK_SIZE);
+		vect[i].iov_len = BLOCK_SIZE;
+	}
+
+	// Do copy.
+	while (sz) {
+		// Enqueue as many read vectors as possible.
+		while (0) { }
+
+		// Restart skipped.
+		while (0) { }
+
+		while (0) {
+			// Enqueue as many write vectors as possible.
+			while (0) { }
+
+			// Restart skipped.
+			while (0) { }
+		}
+	}
+
+
+	for (int i = 0; i < QUEUE_DEPTH; i++)
+		free(vect[i].iov_base);
 	return 0;
 }
 
@@ -109,7 +141,8 @@ int main(int argc, char *argv[]) {
 	struct io_uring_sqe *sqe;
 
 
-	cp0(ifd, ofd, sz);
+	//cp0(ifd, ofd, sz);
+	cp1(ifd, ofd, sz);
 
 
 	io_uring_queue_exit(&ring);
