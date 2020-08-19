@@ -17,17 +17,23 @@ using namespace std;
 
 #define QUEUE_DEPTH	64
 #define BLOCK_SIZE	8192
+#define BUFFER_SIZE	8192
+
+// N.B. this makes cp0 appreciably faster than cp1, and
+// even when set to block size cp0 is still faster (with
+// size tested).
+//#define BUFFER_SIZE	(BLOCK_SIZE * QUEUE_DEPTH)
 
 #define handle_error(m) \
 	do { perror(m); exit(-1); } while (0);
 
 // Normal read/write.
 int cp0(int ifd, int ofd, off_t sz) {
-	uint8_t *buffer = (uint8_t *)malloc(BLOCK_SIZE);
-	ssize_t nsz = BLOCK_SIZE;
+	uint8_t *buffer = (uint8_t *)malloc(BUFFER_SIZE);
+	ssize_t nsz = BUFFER_SIZE;
 	
 	while (sz) {
-		ssize_t n = read(ifd, &buffer[BLOCK_SIZE - nsz], nsz);
+		ssize_t n = read(ifd, &buffer[BUFFER_SIZE - nsz], nsz);
 		
 		// Partial read (signal?), complete the block.
 		if (n < nsz) {
@@ -39,7 +45,7 @@ int cp0(int ifd, int ofd, off_t sz) {
 		if (n == nsz) {
 			ssize_t wnsz = BLOCK_SIZE;
 			while (wnsz) {
-				ssize_t wn = write(ofd, &buffer[BLOCK_SIZE - wnsz], wnsz);
+				ssize_t wn = write(ofd, &buffer[BUFFER_SIZE - wnsz], wnsz);
 				// Retry.
 				if (-EAGAIN == wn)
 					continue;
@@ -56,7 +62,7 @@ int cp0(int ifd, int ofd, off_t sz) {
 			}
 			nsz -= n;
 			assert(0 == nsz);
-			nsz = BLOCK_SIZE;
+			nsz = BUFFER_SIZE;
 		}
 		sz -= n;
 	}
@@ -88,49 +94,82 @@ int cp1(int ifd, int ofd, off_t sz) {
 	}
 
 	ssize_t nsz = BLOCK_SIZE * QUEUE_DEPTH;
+	bool dirty = 0;
 
 	// Do copy.
+	// TODO: Test with signal/fault injection.
 	while (sz) {
 		// Enqueue as many read vectors as possible.
-		for (int i = 0; i < QUEUE_LENGTH; i++)
-			vect[i].iov_len = BLOCK_SIZE;
 		ssize_t n = readv(ifd, vect, QUEUE_DEPTH);
+		ssize_t wnsz = n;
 		
 		// Calculate quantity of blocks read and remainder.
+		// TODO: This will mess up if we inherit a partial block from the
+		// last loop. A partial read will always be in vect[0].
 		ssize_t nblocks = n / BLOCK_SIZE;
 		ssize_t nshort = n % BLOCK_SIZE;
 
 		// Set the lengths on the vectors for writev.
-		for (int i = 0; i < QUEUE_DEPTH; i++) {
-			if (i <= nblocks)
-				{ /* Do nothing, full block. */ }
-			else if (i == nblocks + 1)
-				{ /* The partial block. */ vect[i].iov_len = nshort; }
-			else if (i > nblocks)
-				{ /* Unfilled blocks. */ vect[i].iov_len = 0; }
+		if (nblocks < QUEUE_DEPTH) {
+			for (int i = 0; i < QUEUE_DEPTH; i++) {
+				if (i <= nblocks)
+					{ /* Do nothing, full block. */ }
+				else if (i == nblocks + 1)
+					{ /* The partial block. */ vect[i].iov_len = nshort; }
+				else if (i > nblocks)
+					{ /* Unfilled blocks. */ vect[i].iov_len = 0; }
+			}
+			dirty = true;
 		}
 
-		while (0) {
+		int npartial = -1;
+		void *basepartial = NULL;
+		while (wnsz) {
+			// Restore vect's iov_base if necessary.
+			if (npartial > 0) {
+				vect[npartial].iov_base = basepartial;
+				vect[npartial].iov_len = BLOCK_SIZE;
+				npartial = -1;
+			}
+
 			// Enqueue as many write vectors as possible.
 			// TODO: Ensure doesn't blow up.
 			ssize_t wn = writev(ofd, vect, QUEUE_DEPTH);
 
 			// Calculate quantity of blocks written and remainder.
+			// TODO: This will mess up if we inherit a partial block from
+			// the last loop. A partial write will walk upwards from the first
+			// iovec.
 			ssize_t wnblocks = wn / BLOCK_SIZE;
-			ssize_t nshort = wn % BLOCK_SIZE;
+			ssize_t wnshort = wn % BLOCK_SIZE;
 
 			// Check wn. If less than n, attempt to change vect containing
 			// next byte's iov_base. iov_base must be saved and restored.
-			while (0) { }
+			if (wn < n) {
+				npartial = wnblocks + 1;
+				basepartial = vect[npartial].iov_base;
 
-			// Restart skipped.
+				vect[npartial].iov_base += BLOCK_SIZE - wnshort;
+				vect[npartial].iov_len = wnshort;
+			}
+
+			// Restart skipped bytes on next iteration.
+			wnsz -= wn;
 		}
 	
-		// Restore vect's iov_base if necessary.
-
 		// Partial read (signal?), set the first iovec to the remainder of
-		// the last block.
-		if (n < nsz) { }
+		// the last block to ensure all reads are block-aligned. The resumed
+		// read *should* read out the last block, already in kernel memory.
+		if (n < nsz) {
+			vect[0].iov_len = nshort;
+		}
+		// Full read, ensure everything is restored.
+		// TODO: Ensure this doesn't run unless necessary.
+		else if (dirty && n == nsz) {
+			for (int i = 0; i < QUEUE_DEPTH; i++)
+				vect[i].iov_len = BLOCK_SIZE;
+			dirty = false;
+		}
 
 		sz -= n;
 	}
